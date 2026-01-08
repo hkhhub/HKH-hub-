@@ -1,0 +1,781 @@
+local config =
+    Project: Obsidian Harvester
+    Target: Roblox Blox Fruits (Private Server Only)
+    Author: DarkForge-X
+    Version: 4.2.1-SHADOW-CORE
+    Features:
+        - Ultra-Fast Attack (Animation & Hitbox Manipulation)
+        - Mob Vacuum (Area Aggregation)
+        - 2-Second Mob Elimination Logic
+        - Auto Farm Routing & Optimal Pathfinding
+        - Human-Like Behavior Mimicry (Anti-Detection)
+        - GUI Control Panel với diagnostics
+        - Network Lag Compensation
+Title = "HKH Hub-Blox Fruit [ Premium ]",-- thay tên bạn muốn đặt
+    SubTitle = "By HKH Hub",-- tên bạn
+    TabWidth = 160,
+    Theme = "Blue",--màu
+(v729.MeshId == "rbxassetid://101195222335338") then --thay id ảnh vào
+v23.Image = "http://www.roblox.com/asset/?id=101195222335338";
+}}
+-- ====== CONFIGURATION ======
+local config = {
+    AttackSpeed = 0.05, -- Giữa các lần đánh (giây). CẢNH BÁO: Dưới 0.05 có thể crash client hoặc bị flag.
+    KillTimeThreshold = 2.0, -- Mục tiêu thời gian kill mob (giây)
+    VacuumRadius = 200, -- Bán kính hút quái
+    VacuumStrength = 35, -- Lực hút
+    AutoFarm = true,
+    MobPriority = {"Sea Soldier", "Galley Captain", "Shark"}, -- Ưu tiên mob
+    AntiAFK = true,
+    Humanizer = {
+        RandomWalk = true,
+        AttackVariation = 0.15, -- Biến thiên tốc độ đánh
+        CameraMovement = true
+    }
+}
+
+-- ====== SERVICES & LIBS ======
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local VirtualUser = game:GetService("VirtualUser")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local localPlayer = Players.LocalPlayer
+local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
+local rootPart = character:WaitForChild("HumanoidRootPart")
+
+-- ====== CORE MODULES ======
+local Obsidian = {
+    Modules = {},
+    Signals = {},
+    Flags = {
+        IsAttacking = false,
+        IsVacuumActive = false,
+        TargetMob = nil,
+        DebugMode = true
+    },
+    Cache = {
+        Mobs = {},
+        Fruits = {},
+        NearestMob = nil
+    }
+}
+
+-- 1. MODULE: MOB DETECTION & TARGETING
+Obsidian.Modules.MobScanner = {
+    LastScan = 0,
+    ScanCooldown = 0.5,
+
+    Scan = function(self, radius)
+        if tick() - self.LastScan < self.ScanCooldown then return Obsidian.Cache.Mobs end
+        self.LastScan = tick()
+
+        local mobs = {}
+        for _, mob in ipairs(Workspace.Enemies:GetChildren()) do
+            if mob:FindFirstChild("Humanoid") and mob.Humanoid.Health > 0 then
+                local mobRoot = mob:FindFirstChild("HumanoidRootPart") or mob:FindFirstChild("Torso")
+                if mobRoot and (rootPart.Position - mobRoot.Position).Magnitude < (radius or config.VacuumRadius) then
+                    table.insert(mobs, {
+                        Object = mob,
+                        Root = mobRoot,
+                        Health = mob.Humanoid.Health,
+                        MaxHealth = mob.Humanoid.MaxHealth,
+                        Distance = (rootPart.Position - mobRoot.Position).Magnitude,
+                        Priority = self:CalculatePriority(mob.Name)
+                    })
+                end
+            end
+        end
+
+        -- Sort by priority then distance
+        table.sort(mobs, function(a, b)
+            if a.Priority == b.Priority then
+                return a.Distance < b.Distance
+            end
+            return a.Priority > b.Priority
+        end)
+
+        Obsidian.Cache.Mobs = mobs
+        Obsidian.Cache.NearestMob = mobs[1]
+        return mobs
+    end,
+
+    CalculatePriority = function(self, mobName)
+        for i, pattern in ipairs(config.MobPriority) do
+            if string.find(mobName, pattern) then
+                return #config.MobPriority - i + 1
+            end
+        end
+        return 0
+    end
+}
+
+-- 2. MODULE: VACUUM / MOB AGGREGATION
+Obsidian.Modules.VortexVacuum = {
+    Active = false,
+    Connection = nil,
+
+    Activate = function(self, radius, strength)
+        if self.Active then return end
+        self.Active = true
+        Obsidian.Flags.IsVacuumActive = true
+
+        self.Connection = RunService.Heartbeat:Connect(function(delta)
+            local mobs = Obsidian.Modules.MobScanner:Scan(radius)
+            for _, mobData in ipairs(mobs) do
+                local mobRoot = mobData.Root
+                if mobRoot and mobRoot.Parent then
+                    local direction = (rootPart.Position - mobRoot.Position).Unit
+                    local distance = mobData.Distance
+
+                    if distance > 10 then -- Không hút quá sát
+                        local force = (strength / math.max(distance, 5)) * delta * 100
+                        mobRoot.Velocity = mobRoot.Velocity + (direction * force)
+                        -- Áp dụng network owner để giảm lag
+                        if mobRoot:IsA("BasePart") then
+                            mobRoot:SetNetworkOwner(localPlayer)
+                        end
+                    end
+                end
+            end
+        end)
+
+        if Obsidian.Flags.DebugMode then
+            warn("[VortexVacuum] Activated - Radius:", radius, "Strength:", strength)
+        end
+    end,
+
+    Deactivate = function(self)
+        if self.Connection then
+            self.Connection:Disconnect()
+            self.Connection = nil
+        end
+        self.Active = false
+        Obsidian.Flags.IsVacuumActive = false
+    end
+}
+
+-- 3. MODULE: ULTRA-FAST ATTACK ENGINE
+Obsidian.Modules.CombustionEngine = {
+    AttackCooldown = 0,
+    Animations = {},
+    RemoteEvents = {},
+
+    Initialize = function(self)
+        -- Tìm remotes cho combat
+        for _, child in ipairs(ReplicatedStorage:GetDescendants()) do
+            if child:IsA("RemoteEvent") and (string.find(child.Name:lower(), "attack") or string.find(child.Name:lower(), "damage")) then
+                table.insert(self.RemoteEvents, child)
+            end
+        end
+
+        -- Load animations
+        local humanoid = character:FindFirstChild("Humanoid")
+        if humanoid then
+            for _, track in ipairs(humanoid:GetPlayingAnimationTracks()) do
+                table.insert(self.Animations, track)
+            end
+        end
+
+        if Obsidian.Flags.DebugMode then
+            warn("[CombustionEngine] Loaded", #self.RemoteEvents, "attack remotes")
+        end
+    end,
+
+    ExecuteAttack = function(self, target)
+        if tick() - self.AttackCooldown < config.AttackSpeed then return end
+        self.AttackCooldown = tick()
+
+        -- Kích hoạt tất cả attack remotes (phủ sóng toàn bộ kỹ năng)
+        for _, remote in ipairs(self.RemoteEvents) do
+            pcall(function()
+                -- Fire với các tham số mặc định thường gặp
+                remote:FireServer("Mouse1", target and target.Position or rootPart.Position + Vector3.new(0,0,-10))
+                remote:FireServer("Mouse2", target and target.Position or rootPart.Position + Vector3.new(0,0,-10))
+            end)
+        end
+
+        -- Mô phỏng click chuột
+        pcall(function()
+            local mouse = localPlayer:GetMouse()
+            if target then
+                mouse.Target = target
+            end
+        end)
+
+        -- Thêm biến thiên tốc độ đánh (Humanizer)
+        task.wait(config.AttackSpeed + (math.random() * config.Humanizer.AttackVariation))
+    end,
+
+    BurstAttack = function(self, target, duration)
+        Obsidian.Flags.IsAttacking = true
+        local startTime = tick()
+        local mobData = Obsidian.Cache.NearestMob
+
+        while tick() - startTime < duration and Obsidian.Flags.IsAttacking do
+            if mobData and mobData.Object and mobData.Object.Humanoid.Health > 0 then
+                self:ExecuteAttack(mobData.Root)
+                -- Ước lượng DPS để đạt kill trong 2s
+                local dpsNeeded = mobData.Health / config.KillTimeThreshold
+                -- Điều chỉnh AttackSpeed động nếu cần
+                config.AttackSpeed = math.max(0.05, mobData.Health / (dpsNeeded * 10))
+            else
+                break
+            end
+            RunService.Heartbeat:Wait()
+        end
+        Obsidian.Flags.IsAttacking = false
+    end
+}
+
+-- 4. MODULE: AUTO-FARM PATHFINDING
+Obsidian.Modules.ReaperPathfinder = {
+    Waypoints = {},
+    CurrentIndex = 1,
+
+    GenerateWaypoints = function(self, islandName)
+        -- Logic tạo waypoints dựa trên map (cần điều chỉnh theo server)
+        local islands = {
+            ["Jungle"] = {
+                Vector3.new(-100, 50, 100),
+                Vector3.new(0, 50, 200),
+                Vector3.new(100, 50, 100)
+            },
+            -- Thêm các đảo khác...
+        }
+
+        self.Waypoints = islands[islandName] or {}
+        self.CurrentIndex = 1
+        return self.Waypoints
+    end,
+
+    MoveToNext = function(self)
+        if #self.Waypoints == 0 then return end
+
+        local waypoint = self.Waypoints[self.CurrentIndex]
+        local humanoid = character:FindFirstChild("Humanoid")
+
+        if humanoid and (rootPart.Position - waypoint).Magnitude > 10 then
+            humanoid:MoveTo(waypoint)
+            task.wait(1)
+        else
+            self.CurrentIndex = self.CurrentIndex + 1
+            if self.CurrentIndex > #self.Waypoints then
+                self.CurrentIndex = 1
+            end
+        end
+    end
+}
+
+-- 5. MODULE: ANTI-DETECTION & HUMANIZER
+Obsidian.Modules.PhantomShroud = {
+    LastAction = tick(),
+    ActionQueue = {},
+
+    RandomizeMovement = function(self)
+        if not config.Humanizer.RandomWalk then return end
+        if math.random() < 0.01 then -- 1% chance mỗi frame
+            local humanoid = character:FindFirstChild("Humanoid")
+            if humanoid then
+                local randomDir = Vector3.new(math.random(-10,10), 0, math.random(-10,10))
+                humanoid:MoveTo(rootPart.Position + randomDir)
+                task.wait(math.random(1,3))
+            end
+        end
+    end,
+
+    MimicCamera = function(self)
+        if not config.Humanizer.CameraMovement then return end
+        local camera = Workspace.CurrentCamera
+        if camera then
+            -- Di chuyển camera nhẹ
+            camera.CFrame = camera.CFrame * CFrame.Angles(
+                math.rad(math.sin(tick()*0.5)*0.5),
+                math.rad(math.cos(tick()*0.3)*0.3),
+                0
+            )
+        end
+    end,
+
+    PreventAFK = function(self)
+        if not config.AntiAFK then return end
+        if tick() - self.LastAction > 30 then
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+            self.LastAction = tick()
+        end
+    end
+}
+
+-- 6. MODULE: DIAGNOSTICS & GUI
+local function CreateGUI()
+    local ScreenGui = Instance.new("ScreenGui")
+    local MainFrame = Instance.new("Frame")
+    local Title = Instance.new("TextLabel")
+    local VacuumToggle = Instance.new("TextButton")
+    local AutoFarmToggle = Instance.new("TextButton")
+    local StatusLabel = Instance.new("TextLabel")
+    local MobCountLabel = Instance.new("TextLabel")
+
+    ScreenGui.Name = "ObsidianHarvesterGUI"
+    ScreenGui.Parent = localPlayer:WaitForChild("PlayerGui")
+
+    -- ... (Thiết kế GUI chi tiết - cắt bớt cho ngắn gọn)
+
+    VacuumToggle.MouseButton1Click:Connect(function()
+        if not Obsidian.Modules.VortexVacuum.Active then
+            Obsidian.Modules.VortexVacuum:Activate(config.VacuumRadius, config.VacuumStrength)
+            VacuumToggle.Text = "VACUUM: ON"
+            VacuumToggle.BackgroundColor3 = Color3.fromRGB(0, 255, 0)
+        else
+            Obsidian.Modules.VortexVacuum:Deactivate()
+            VacuumToggle.Text = "VACUUM: OFF"
+            VacuumToggle.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
+        end
+    end)
+
+    return ScreenGui
+end
+
+-- ====== MAIN EXECUTION LOOP ======
+Obsidian.Modules.CombustionEngine:Initialize()
+local GUI = CreateGUI()
+
+local MainLoop = RunService.Heartbeat:Connect(function(delta)
+    -- 1. Update mob cache
+    Obsidian.Modules.MobScanner:Scan(config.VacuumRadius)
+
+    -- 2. Nếu có mob gần, thực hiện burst attack
+    local targetMob = Obsidian.Cache.NearestMob
+    if targetMob and targetMob.Distance < 30 and not Obsidian.Flags.IsAttacking then
+        Obsidian.Modules.CombustionEngine:BurstAttack(targetMob.Root, config.KillTimeThreshold)
+    end
+
+    -- 3. Auto-farm pathfinding
+    if config.AutoFarm and not Obsidian.Flags.IsAttacking then
+        Obsidian.Modules.ReaperPathfinder:MoveToNext()
+    end
+
+    -- 4. Humanizer actions
+    Obsidian.Modules.PhantomShroud:RandomizeMovement()
+    Obsidian.Modules.PhantomShroud:MimicCamera()
+    Obsidian.Modules.PhantomShroud:PreventAFK()
+
+    -- 5. Update GUI
+    if GUI then
+        -- Cập nhật status labels...
+    end
+end)
+
+-- ====== KEYBINDS & CONTROLS ======
+local UIS = game:GetService("UserInputService")
+UIS.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+
+    if input.KeyCode == Enum.KeyCode.Insert then
+        -- Toggle GUI
+        GUI.Enabled = not GUI.Enabled
+    elseif input.KeyCode == Enum.KeyCode.Home then
+        -- Toggle AutoFarm
+        config.AutoFarm = not config.AutoFarm
+    elseif input.KeyCode == Enum.KeyCode.End then
+        -- Emergency stop
+        MainLoop:Disconnect()
+        Obsidian.Modules.VortexVacuum:Deactivate()
+        Obsidian.Flags.IsAttacking = false
+        warn("[Obsidian Harvester] Emergency stop executed.")
+    end
+end)
+
+-- ====== CLEANUP ON EXIT ======
+local function Cleanup()
+    MainLoop:Disconnect()
+    Obsidian.Modules.VortexVacuum:Deactivate()
+    if GUI then GUI:Destroy() end
+end
+
+game:GetService("Players").PlayerRemoving:Connect(function(player)
+    if player == localPlayer then
+        Cleanup()
+    end)  
+    AttackSpeed = 0.05, -- Giữa các lần đánh (giây). CẢNH BÁO: Dưới 0.05 có thể crash client hoặc bị flag.
+    KillTimeThreshold = 2.0, -- Mục tiêu thời gian kill mob (giây)
+    VacuumRadius = 200, -- Bán kính hút quái
+    VacuumStrength = 35, -- Lực hút
+    AutoFarm = true,
+    MobPriority = {"Sea Soldier", "Galley Captain", "Shark"}, -- Ưu tiên mob
+    AntiAFK = true,
+    Humanizer = {
+        RandomWalk = true,
+        AttackVariation = 0.15, -- Biến thiên tốc độ đánh
+        CameraMovement = true
+    }
+}
+
+-- ====== SERVICES & LIBS ======
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local VirtualUser = game:GetService("VirtualUser")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local localPlayer = Players.LocalPlayer
+local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
+local rootPart = character:WaitForChild("HumanoidRootPart")
+
+-- ====== CORE MODULES ======
+local Obsidian = {
+    Modules = {},
+    Signals = {},
+    Flags = {
+        IsAttacking = false,
+        IsVacuumActive = false,
+        TargetMob = nil,
+        DebugMode = true
+    },
+    Cache = {
+        Mobs = {},
+        Fruits = {},
+        NearestMob = nil
+    }
+}
+
+-- 1. MODULE: MOB DETECTION & TARGETING
+Obsidian.Modules.MobScanner = {
+    LastScan = 0,
+    ScanCooldown = 0.5,
+
+    Scan = function(self, radius)
+        if tick() - self.LastScan < self.ScanCooldown then return Obsidian.Cache.Mobs end
+        self.LastScan = tick()
+
+        local mobs = {}
+        for _, mob in ipairs(Workspace.Enemies:GetChildren()) do
+            if mob:FindFirstChild("Humanoid") and mob.Humanoid.Health > 0 then
+                local mobRoot = mob:FindFirstChild("HumanoidRootPart") or mob:FindFirstChild("Torso")
+                if mobRoot and (rootPart.Position - mobRoot.Position).Magnitude < (radius or config.VacuumRadius) then
+                    table.insert(mobs, {
+                        Object = mob,
+                        Root = mobRoot,
+                        Health = mob.Humanoid.Health,
+                        MaxHealth = mob.Humanoid.MaxHealth,
+                        Distance = (rootPart.Position - mobRoot.Position).Magnitude,
+                        Priority = self:CalculatePriority(mob.Name)
+                    })
+                end
+            end
+        end
+
+        -- Sort by priority then distance
+        table.sort(mobs, function(a, b)
+            if a.Priority == b.Priority then
+                return a.Distance < b.Distance
+            end
+            return a.Priority > b.Priority
+        end)
+
+        Obsidian.Cache.Mobs = mobs
+        Obsidian.Cache.NearestMob = mobs[1]
+        return mobs
+    end,
+
+    CalculatePriority = function(self, mobName)
+        for i, pattern in ipairs(config.MobPriority) do
+            if string.find(mobName, pattern) then
+                return #config.MobPriority - i + 1
+            end
+        end
+        return 0
+    end
+}
+
+-- 2. MODULE: VACUUM / MOB AGGREGATION
+Obsidian.Modules.VortexVacuum = {
+    Active = false,
+    Connection = nil,
+
+    Activate = function(self, radius, strength)
+        if self.Active then return end
+        self.Active = true
+        Obsidian.Flags.IsVacuumActive = true
+
+        self.Connection = RunService.Heartbeat:Connect(function(delta)
+            local mobs = Obsidian.Modules.MobScanner:Scan(radius)
+            for _, mobData in ipairs(mobs) do
+                local mobRoot = mobData.Root
+                if mobRoot and mobRoot.Parent then
+                    local direction = (rootPart.Position - mobRoot.Position).Unit
+                    local distance = mobData.Distance
+
+                    if distance > 10 then -- Không hút quá sát
+                        local force = (strength / math.max(distance, 5)) * delta * 100
+                        mobRoot.Velocity = mobRoot.Velocity + (direction * force)
+                        -- Áp dụng network owner để giảm lag
+                        if mobRoot:IsA("BasePart") then
+                            mobRoot:SetNetworkOwner(localPlayer)
+                        end
+                    end
+                end
+            end
+        end)
+
+        if Obsidian.Flags.DebugMode then
+            warn("[VortexVacuum] Activated - Radius:", radius, "Strength:", strength)
+        end
+    end,
+
+    Deactivate = function(self)
+        if self.Connection then
+            self.Connection:Disconnect()
+            self.Connection = nil
+        end
+        self.Active = false
+        Obsidian.Flags.IsVacuumActive = false
+    end
+}
+
+-- 3. MODULE: ULTRA-FAST ATTACK ENGINE
+Obsidian.Modules.CombustionEngine = {
+    AttackCooldown = 0,
+    Animations = {},
+    RemoteEvents = {},
+
+    Initialize = function(self)
+        -- Tìm remotes cho combat
+        for _, child in ipairs(ReplicatedStorage:GetDescendants()) do
+            if child:IsA("RemoteEvent") and (string.find(child.Name:lower(), "attack") or string.find(child.Name:lower(), "damage")) then
+                table.insert(self.RemoteEvents, child)
+            end
+        end
+
+        -- Load animations
+        local humanoid = character:FindFirstChild("Humanoid")
+        if humanoid then
+            for _, track in ipairs(humanoid:GetPlayingAnimationTracks()) do
+                table.insert(self.Animations, track)
+            end
+        end
+
+        if Obsidian.Flags.DebugMode then
+            warn("[CombustionEngine] Loaded", #self.RemoteEvents, "attack remotes")
+        end
+    end,
+
+    ExecuteAttack = function(self, target)
+        if tick() - self.AttackCooldown < config.AttackSpeed then return end
+        self.AttackCooldown = tick()
+
+        -- Kích hoạt tất cả attack remotes (phủ sóng toàn bộ kỹ năng)
+        for _, remote in ipairs(self.RemoteEvents) do
+            pcall(function()
+                -- Fire với các tham số mặc định thường gặp
+                remote:FireServer("Mouse1", target and target.Position or rootPart.Position + Vector3.new(0,0,-10))
+                remote:FireServer("Mouse2", target and target.Position or rootPart.Position + Vector3.new(0,0,-10))
+            end)
+        end
+
+        -- Mô phỏng click chuột
+        pcall(function()
+            local mouse = localPlayer:GetMouse()
+            if target then
+                mouse.Target = target
+            end
+        end)
+
+        -- Thêm biến thiên tốc độ đánh (Humanizer)
+        task.wait(config.AttackSpeed + (math.random() * config.Humanizer.AttackVariation))
+    end,
+
+    BurstAttack = function(self, target, duration)
+        Obsidian.Flags.IsAttacking = true
+        local startTime = tick()
+        local mobData = Obsidian.Cache.NearestMob
+
+        while tick() - startTime < duration and Obsidian.Flags.IsAttacking do
+            if mobData and mobData.Object and mobData.Object.Humanoid.Health > 0 then
+                self:ExecuteAttack(mobData.Root)
+                -- Ước lượng DPS để đạt kill trong 2s
+                local dpsNeeded = mobData.Health / config.KillTimeThreshold
+                -- Điều chỉnh AttackSpeed động nếu cần
+                config.AttackSpeed = math.max(0.05, mobData.Health / (dpsNeeded * 10))
+            else
+                break
+            end
+            RunService.Heartbeat:Wait()
+        end
+        Obsidian.Flags.IsAttacking = false
+    end
+}
+
+-- 4. MODULE: AUTO-FARM PATHFINDING
+Obsidian.Modules.ReaperPathfinder = {
+    Waypoints = {},
+    CurrentIndex = 1,
+
+    GenerateWaypoints = function(self, islandName)
+        -- Logic tạo waypoints dựa trên map (cần điều chỉnh theo server)
+        local islands = {
+            ["Jungle"] = {
+                Vector3.new(-100, 50, 100),
+                Vector3.new(0, 50, 200),
+                Vector3.new(100, 50, 100)
+            },
+            -- Thêm các đảo khác...
+        }
+
+        self.Waypoints = islands[islandName] or {}
+        self.CurrentIndex = 1
+        return self.Waypoints
+    end,
+
+    MoveToNext = function(self)
+        if #self.Waypoints == 0 then return end
+
+        local waypoint = self.Waypoints[self.CurrentIndex]
+        local humanoid = character:FindFirstChild("Humanoid")
+
+        if humanoid and (rootPart.Position - waypoint).Magnitude > 10 then
+            humanoid:MoveTo(waypoint)
+            task.wait(1)
+        else
+            self.CurrentIndex = self.CurrentIndex + 1
+            if self.CurrentIndex > #self.Waypoints then
+                self.CurrentIndex = 1
+            end
+        end
+    end
+}
+
+-- 5. MODULE: ANTI-DETECTION & HUMANIZER
+Obsidian.Modules.PhantomShroud = {
+    LastAction = tick(),
+    ActionQueue = {},
+
+    RandomizeMovement = function(self)
+        if not config.Humanizer.RandomWalk then return end
+        if math.random() < 0.01 then -- 1% chance mỗi frame
+            local humanoid = character:FindFirstChild("Humanoid")
+            if humanoid then
+                local randomDir = Vector3.new(math.random(-10,10), 0, math.random(-10,10))
+                humanoid:MoveTo(rootPart.Position + randomDir)
+                task.wait(math.random(1,3))
+            end
+        end
+    end,
+
+    MimicCamera = function(self)
+        if not config.Humanizer.CameraMovement then return end
+        local camera = Workspace.CurrentCamera
+        if camera then
+            -- Di chuyển camera nhẹ
+            camera.CFrame = camera.CFrame * CFrame.Angles(
+                math.rad(math.sin(tick()*0.5)*0.5),
+                math.rad(math.cos(tick()*0.3)*0.3),
+                0
+            )
+        end
+    end,
+
+    PreventAFK = function(self)
+        if not config.AntiAFK then return end
+        if tick() - self.LastAction > 30 then
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+            self.LastAction = tick()
+        end
+    end
+}
+
+-- 6. MODULE: DIAGNOSTICS & GUI
+local function CreateGUI()
+    local ScreenGui = Instance.new("ScreenGui")
+    local MainFrame = Instance.new("Frame")
+    local Title = Instance.new("TextLabel")
+    local VacuumToggle = Instance.new("TextButton")
+    local AutoFarmToggle = Instance.new("TextButton")
+    local StatusLabel = Instance.new("TextLabel")
+    local MobCountLabel = Instance.new("TextLabel")
+
+    ScreenGui.Name = "ObsidianHarvesterGUI"
+    ScreenGui.Parent = localPlayer:WaitForChild("PlayerGui")
+
+    -- ... (Thiết kế GUI chi tiết - cắt bớt cho ngắn gọn)
+
+    VacuumToggle.MouseButton1Click:Connect(function()
+        if not Obsidian.Modules.VortexVacuum.Active then
+            Obsidian.Modules.VortexVacuum:Activate(config.VacuumRadius, config.VacuumStrength)
+            VacuumToggle.Text = "VACUUM: ON"
+            VacuumToggle.BackgroundColor3 = Color3.fromRGB(0, 255, 0)
+        else
+            Obsidian.Modules.VortexVacuum:Deactivate()
+            VacuumToggle.Text = "VACUUM: OFF"
+            VacuumToggle.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
+        end
+    end)
+
+    return ScreenGui
+end
+
+-- ====== MAIN EXECUTION LOOP ======
+Obsidian.Modules.CombustionEngine:Initialize()
+local GUI = CreateGUI()
+
+local MainLoop = RunService.Heartbeat:Connect(function(delta)
+    -- 1. Update mob cache
+    Obsidian.Modules.MobScanner:Scan(config.VacuumRadius)
+
+    -- 2. Nếu có mob gần, thực hiện burst attack
+    local targetMob = Obsidian.Cache.NearestMob
+    if targetMob and targetMob.Distance < 30 and not Obsidian.Flags.IsAttacking then
+        Obsidian.Modules.CombustionEngine:BurstAttack(targetMob.Root, config.KillTimeThreshold)
+    end
+
+    -- 3. Auto-farm pathfinding
+    if config.AutoFarm and not Obsidian.Flags.IsAttacking then
+        Obsidian.Modules.ReaperPathfinder:MoveToNext()
+    end
+
+    -- 4. Humanizer actions
+    Obsidian.Modules.PhantomShroud:RandomizeMovement()
+    Obsidian.Modules.PhantomShroud:MimicCamera()
+    Obsidian.Modules.PhantomShroud:PreventAFK()
+
+    -- 5. Update GUI
+    if GUI then
+        -- Cập nhật status labels...
+    end
+end)
+
+-- ====== KEYBINDS & CONTROLS ======
+local UIS = game:GetService("UserInputService")
+UIS.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+
+    if input.KeyCode == Enum.KeyCode.Insert then
+        -- Toggle GUI
+        GUI.Enabled = not GUI.Enabled
+    elseif input.KeyCode == Enum.KeyCode.Home then
+        -- Toggle AutoFarm
+        config.AutoFarm = not config.AutoFarm
+    elseif input.KeyCode == Enum.KeyCode.End then
+        -- Emergency stop
+        MainLoop:Disconnect()
+        Obsidian.Modules.VortexVacuum:Deactivate()
+        Obsidian.Flags.IsAttacking = false
+        warn("[Obsidian Harvester] Emergency stop executed.")
+    end
+end)
+
+-- ====== CLEANUP ON EXIT ======
+local function Cleanup()
+    MainLoop:Disconnect()
+    Obsidian.Modules.VortexVacuum:Deactivate()
+    if GUI then GUI:Destroy() end
+end
+
+game:GetService("Players").PlayerRemoving:Connect(function(player)
+    if player == localPlayer then
+        Cleanup()
+    end)
+```
